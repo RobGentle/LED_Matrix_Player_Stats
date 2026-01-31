@@ -1,0 +1,717 @@
+"""
+Data fetching and extraction for LivePlayerStats plugin.
+
+Handles ESPN API integration and extraction of stat leaders for
+basketball (NBA/NCAAM) and football (NFL/NCAAF) games.
+"""
+
+from typing import Dict, List, Optional
+from datetime import datetime
+
+
+# ESPN API league mapping
+LEAGUE_MAP = {
+    'nba': ('basketball', 'nba'),
+    'nfl': ('football', 'nfl'),
+    'ncaam': ('basketball', 'mens-college-basketball'),
+    'ncaaf': ('football', 'college-football')
+}
+
+# NCAA API base URL
+NCAA_API_BASE = "https://ncaa-api.henrygd.me"
+
+# Basketball stat array indices (from ESPN API)
+BASKETBALL_STAT_INDICES = {
+    'PTS': 15,  # Points
+    'REB': 10,  # Rebounds
+    'AST': 11   # Assists
+}
+
+
+class DataFetcher:
+    """Fetches and extracts player statistics from ESPN API."""
+
+    def __init__(self, api_helper, cache_manager, logger):
+        """
+        Initialize data fetcher.
+
+        Args:
+            api_helper: APIHelper instance for ESPN requests
+            cache_manager: CacheManager for data caching
+            logger: Logger instance
+        """
+        self.api_helper = api_helper
+        self.cache_manager = cache_manager
+        self.logger = logger
+
+    def fetch_live_games(self, league_key: str, max_games: int = 50) -> List[Dict]:
+        """
+        Fetch live games for a specific league.
+
+        Args:
+            league_key: League identifier ('nba', 'nfl', 'ncaam', 'ncaaf')
+            max_games: Maximum number of games to return
+
+        Returns:
+            List of game dictionaries with extracted stats
+        """
+        if league_key not in LEAGUE_MAP:
+            self.logger.warning(f"Unknown league: {league_key}")
+            return []
+
+        # Use NCAA API for college basketball (better player stats)
+        if league_key == 'ncaam':
+            return self._fetch_ncaa_basketball_games(max_games)
+
+        sport, league = LEAGUE_MAP[league_key]
+
+        # Create cache key with current date
+        date_str = datetime.now().strftime('%Y%m%d')
+        cache_key = f"live_stats_{league_key}_{date_str}"
+
+        try:
+            # Fetch scoreboard with 60-second cache for live updates
+            scoreboard = self.api_helper.fetch_espn_scoreboard(
+                sport=sport,
+                league=league,
+                cache_key=cache_key,
+                cache_ttl=60
+            )
+
+            if not scoreboard or 'events' not in scoreboard:
+                self.logger.debug(f"No scoreboard data for {league_key}")
+                return []
+
+            # Extract live games
+            live_games = []
+            total_events = len(scoreboard.get('events', []))
+            self.logger.debug(f"Processing {total_events} total events for {league_key}")
+
+            for event in scoreboard.get('events', []):
+                # Stop if we've reached max games
+                if len(live_games) >= max_games:
+                    self.logger.info(f"Reached max_games limit ({max_games}) for {league_key}")
+                    break
+
+                # Only process games that are live (in progress)
+                status_state = event.get('status', {}).get('type', {}).get('state')
+                status_detail = event.get('status', {}).get('type', {}).get('detail', '')
+
+                # Log game status for debugging
+                comp = event.get('competitions', [{}])[0]
+                comps = comp.get('competitors', [])
+                if len(comps) >= 2:
+                    away = comps[0].get('team', {}).get('abbreviation', '?')
+                    home = comps[1].get('team', {}).get('abbreviation', '?')
+                    self.logger.info(f"Game: {away} @ {home}, Status: {status_state} ({status_detail})")
+
+                if status_state != 'in':
+                    continue
+
+                # Parse game event
+                game_info = self._parse_game_event(event, league_key)
+                if game_info:
+                    live_games.append(game_info)
+                    self.logger.info(f"Parsed live game: {game_info.get('away_abbr')} @ {game_info.get('home_abbr')}, "
+                                   f"home_leaders: {bool(game_info.get('home_leaders'))}, "
+                                   f"away_leaders: {bool(game_info.get('away_leaders'))}")
+
+            self.logger.info(f"Found {len(live_games)} live games in {league_key} (out of {total_events} total, max={max_games})")
+            return live_games
+
+        except Exception as e:
+            self.logger.error(f"Error fetching live games for {league_key}: {e}", exc_info=True)
+            return []
+
+    def _parse_game_event(self, event: Dict, league_key: str) -> Optional[Dict]:
+        """
+        Parse a game event and extract relevant information.
+
+        Args:
+            event: ESPN API event dictionary
+            league_key: League identifier for sport-specific parsing
+
+        Returns:
+            Dictionary with game info and stat leaders, or None if parsing fails
+        """
+        try:
+            competition = event.get('competitions', [{}])[0]
+            status = event.get('status', {})
+            competitors = competition.get('competitors', [])
+            game_id = event.get('id')
+
+            if len(competitors) < 2:
+                return None
+
+            # Identify home and away teams
+            home_team = next((c for c in competitors if c.get('homeAway') == 'home'), None)
+            away_team = next((c for c in competitors if c.get('homeAway') == 'away'), None)
+
+            if not home_team or not away_team:
+                return None
+
+            # Extract basic game info
+            game_data = {
+                'id': game_id,
+                'league': league_key,
+                'home_abbr': home_team.get('team', {}).get('abbreviation', 'HOME'),
+                'away_abbr': away_team.get('team', {}).get('abbreviation', 'AWAY'),
+                'home_score': int(home_team.get('score', 0)),
+                'away_score': int(away_team.get('score', 0)),
+                'period': status.get('period', 0),
+                'clock': status.get('displayClock', ''),
+                'period_text': status.get('type', {}).get('shortDetail', ''),
+            }
+
+            # Fetch detailed boxscore for player stats
+            if game_id:
+                boxscore = self._fetch_game_boxscore(game_id, league_key)
+                if boxscore:
+                    # Extract stat leaders from boxscore
+                    if league_key in ['nba', 'ncaam']:
+                        game_data['home_leaders'] = self._extract_boxscore_basketball_leaders(boxscore, 'home')
+                        game_data['away_leaders'] = self._extract_boxscore_basketball_leaders(boxscore, 'away')
+                    elif league_key in ['nfl', 'ncaaf']:
+                        game_data['home_leaders'] = self._extract_boxscore_football_leaders(boxscore, 'home')
+                        game_data['away_leaders'] = self._extract_boxscore_football_leaders(boxscore, 'away')
+                else:
+                    # Fallback to scoreboard data (will likely be None)
+                    if league_key in ['nba', 'ncaam']:
+                        game_data['home_leaders'] = self.extract_basketball_leaders(home_team)
+                        game_data['away_leaders'] = self.extract_basketball_leaders(away_team)
+                    elif league_key in ['nfl', 'ncaaf']:
+                        game_data['home_leaders'] = self.extract_football_leaders(home_team)
+                        game_data['away_leaders'] = self.extract_football_leaders(away_team)
+
+            return game_data
+
+        except Exception as e:
+            self.logger.warning(f"Error parsing game event: {e}")
+            return None
+
+    def _fetch_game_boxscore(self, game_id: str, league_key: str) -> Optional[Dict]:
+        """
+        Fetch detailed boxscore for a specific game.
+
+        Args:
+            game_id: ESPN game ID
+            league_key: League identifier
+
+        Returns:
+            Boxscore data or None if unavailable
+        """
+        sport, league = LEAGUE_MAP.get(league_key, (None, None))
+        if not sport or not league:
+            return None
+
+        try:
+            # ESPN boxscore/summary endpoint
+            url = f"https://site.web.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary"
+            params = {'event': game_id}
+            cache_key = f"boxscore_{league_key}_{game_id}"
+
+            response = self.api_helper.get(
+                url,
+                params=params,
+                cache_key=cache_key,
+                cache_ttl=60
+            )
+
+            return response
+
+        except Exception as e:
+            self.logger.debug(f"Error fetching boxscore for game {game_id}: {e}")
+            return None
+
+    def _extract_boxscore_basketball_leaders(self, boxscore: Dict, home_away: str) -> Optional[Dict]:
+        """
+        Extract basketball leaders from boxscore data.
+
+        Args:
+            boxscore: Boxscore response from ESPN
+            home_away: 'home' or 'away'
+
+        Returns:
+            Leaders dict or None
+        """
+        try:
+            # Navigate boxscore structure
+            # Boxscore typically has: boxscore.players array with team data
+            players_section = boxscore.get('boxscore', {}).get('players', [])
+
+            # Find the team (home is usually index 1, away is 0, but check homeAway field)
+            team_data = None
+            for team in players_section:
+                team_info = team.get('team', {})
+                if team_info.get('homeAway') == home_away:
+                    team_data = team
+                    break
+
+            if not team_data:
+                self.logger.debug(f"No team data found for {home_away} in boxscore")
+                return None
+
+            # Get statistics from players
+            statistics = team_data.get('statistics', [])
+            if not statistics:
+                return None
+
+            # Find the main stats section (usually first one with athletes)
+            stats_group = statistics[0] if statistics else None
+            if not stats_group:
+                return None
+
+            athletes = stats_group.get('athletes', [])
+            if not athletes:
+                return None
+
+            # Extract leaders for PTS, REB, AST
+            leaders = {}
+            max_pts = {'name': None, 'value': 0}
+            max_reb = {'name': None, 'value': 0}
+            max_ast = {'name': None, 'value': 0}
+
+            for athlete in athletes:
+                name = athlete.get('athlete', {}).get('shortName', athlete.get('athlete', {}).get('displayName', 'Unknown'))
+                stats = athlete.get('stats', [])
+
+                # Stats are usually strings in order, need to find PTS/REB/AST
+                # Common order: MIN, FG, 3PT, FT, OREB, DREB, REB, AST, STL, BLK, TO, PF, PTS
+                # But this varies, so we need to check the labels
+                if len(stats) >= 13:  # Typical basketball stat line length
+                    try:
+                        pts = int(stats[-1]) if stats[-1] else 0  # PTS usually last
+                        reb = int(stats[6]) if len(stats) > 6 and stats[6] else 0  # REB usually index 6
+                        ast = int(stats[7]) if len(stats) > 7 and stats[7] else 0  # AST usually index 7
+
+                        if pts > max_pts['value']:
+                            max_pts = {'name': name, 'value': pts}
+                        if reb > max_reb['value']:
+                            max_reb = {'name': name, 'value': reb}
+                        if ast > max_ast['value']:
+                            max_ast = {'name': name, 'value': ast}
+                    except (ValueError, IndexError):
+                        continue
+
+            if max_pts['name']:
+                leaders['PTS'] = max_pts
+            if max_reb['name']:
+                leaders['REB'] = max_reb
+            if max_ast['name']:
+                leaders['AST'] = max_ast
+
+            return leaders if leaders else None
+
+        except Exception as e:
+            self.logger.debug(f"Error extracting basketball leaders from boxscore: {e}")
+            return None
+
+    def _extract_boxscore_football_leaders(self, boxscore: Dict, home_away: str) -> Optional[Dict]:
+        """
+        Extract football leaders from boxscore data.
+
+        Args:
+            boxscore: Boxscore response from ESPN
+            home_away: 'home' or 'away'
+
+        Returns:
+            Leaders dict or None
+        """
+        # Similar structure to basketball, but look for passing/rushing/receiving stats
+        # Implementation similar to _extract_boxscore_basketball_leaders
+        # For now, return None as football structure may differ
+        return None
+
+    def extract_basketball_leaders(self, competitor_data: Dict) -> Optional[Dict]:
+        """
+        Extract basketball stat leaders from competitor data.
+
+        Finds the top player for PTS, REB, and AST.
+
+        Args:
+            competitor_data: Competitor dictionary from ESPN API
+
+        Returns:
+            Dictionary with stat leaders {'PTS': {'name': 'L. James', 'value': 24}, ...}
+            or None if stats unavailable
+        """
+        try:
+            stats_section = competitor_data.get('statistics', [])
+            if not stats_section:
+                self.logger.debug(f"No statistics section found for competitor")
+                return None
+
+            # Log what stat sections are available
+            section_names = [s.get('name') for s in stats_section if isinstance(s, dict)]
+            self.logger.debug(f"Available stat sections: {section_names}")
+
+            # Find athletes section
+            athletes_data = next((s for s in stats_section if s.get('name') == 'athletes'), None)
+            if not athletes_data or 'athletes' not in athletes_data:
+                self.logger.debug(f"No athletes section found. Stats structure: {stats_section[:1] if stats_section else 'empty'}")
+                return None
+
+            athletes = athletes_data.get('athletes', [])
+            if not athletes:
+                return None
+
+            leaders = {}
+
+            # Find leader for each stat category
+            for stat_type, stat_index in BASKETBALL_STAT_INDICES.items():
+                max_value = 0
+                top_player = None
+
+                for athlete in athletes:
+                    try:
+                        stats = athlete.get('stats', [])
+                        if len(stats) > stat_index:
+                            value = int(stats[stat_index])
+                            if value > max_value:
+                                max_value = value
+                                # Use shortName if available, otherwise displayName
+                                athlete_info = athlete.get('athlete', {})
+                                top_player = athlete_info.get('shortName',
+                                            athlete_info.get('displayName', 'Unknown'))
+                    except (ValueError, TypeError, IndexError):
+                        continue
+
+                if top_player and max_value > 0:
+                    leaders[stat_type] = {
+                        'name': top_player,
+                        'value': max_value
+                    }
+
+            return leaders if leaders else None
+
+        except Exception as e:
+            self.logger.debug(f"Error extracting basketball leaders: {e}")
+            return None
+
+    def extract_football_leaders(self, competitor_data: Dict) -> Optional[Dict]:
+        """
+        Extract football stat leaders from competitor data.
+
+        Finds the leading QB (passing), WR (receiving), and RB (rushing).
+
+        Args:
+            competitor_data: Competitor dictionary from ESPN API
+
+        Returns:
+            Dictionary with stat leaders {'QB': {'name': 'Mahomes', 'stats': '245 YDS, 3 TD'}, ...}
+            or None if stats unavailable
+        """
+        try:
+            stats_section = competitor_data.get('statistics', [])
+            if not stats_section:
+                return None
+
+            leaders = {}
+
+            # Extract QB (top passer)
+            passing_data = next((s for s in stats_section if s.get('name') == 'passing'), None)
+            if passing_data and passing_data.get('athletes'):
+                qb = passing_data['athletes'][0]  # Top passer
+                qb_stats = qb.get('stats', [])
+                if len(qb_stats) >= 4:
+                    try:
+                        yds = qb_stats[2]  # Passing yards
+                        tds = qb_stats[3]  # Passing TDs
+                        athlete_info = qb.get('athlete', {})
+                        qb_name = self._abbreviate_name(
+                            athlete_info.get('displayName', 'Unknown')
+                        )
+                        leaders['QB'] = {
+                            'name': qb_name,
+                            'stats': f"{yds} YDS, {tds} TD"
+                        }
+                    except (ValueError, IndexError):
+                        pass
+
+            # Extract WR (top receiver)
+            receiving_data = next((s for s in stats_section if s.get('name') == 'receiving'), None)
+            if receiving_data and receiving_data.get('athletes'):
+                wr = receiving_data['athletes'][0]  # Top receiver
+                wr_stats = wr.get('stats', [])
+                if len(wr_stats) >= 4:
+                    try:
+                        yds = wr_stats[1]  # Receiving yards
+                        tds = wr_stats[3]  # Receiving TDs
+                        athlete_info = wr.get('athlete', {})
+                        wr_name = self._abbreviate_name(
+                            athlete_info.get('displayName', 'Unknown')
+                        )
+                        leaders['WR'] = {
+                            'name': wr_name,
+                            'stats': f"{yds} YDS, {tds} TD"
+                        }
+                    except (ValueError, IndexError):
+                        pass
+
+            # Extract RB (top rusher)
+            rushing_data = next((s for s in stats_section if s.get('name') == 'rushing'), None)
+            if rushing_data and rushing_data.get('athletes'):
+                rb = rushing_data['athletes'][0]  # Top rusher
+                rb_stats = rb.get('stats', [])
+                if len(rb_stats) >= 4:
+                    try:
+                        yds = rb_stats[1]  # Rushing yards
+                        tds = rb_stats[3]  # Rushing TDs
+                        athlete_info = rb.get('athlete', {})
+                        rb_name = self._abbreviate_name(
+                            athlete_info.get('displayName', 'Unknown')
+                        )
+                        leaders['RB'] = {
+                            'name': rb_name,
+                            'stats': f"{yds} YDS, {tds} TD"
+                        }
+                    except (ValueError, IndexError):
+                        pass
+
+            return leaders if leaders else None
+
+        except Exception as e:
+            self.logger.debug(f"Error extracting football leaders: {e}")
+            return None
+
+    def _abbreviate_name(self, full_name: str) -> str:
+        """
+        Abbreviate player name for compact display.
+
+        Args:
+            full_name: Full player name (e.g., "Patrick Mahomes")
+
+        Returns:
+            Abbreviated name (e.g., "P. Mahomes" or "Mahomes")
+        """
+        parts = full_name.split()
+
+        if len(parts) >= 2:
+            # Use last name only if short enough
+            if len(parts[-1]) <= 8:
+                return parts[-1]
+            # Otherwise use "F. Lastname" format
+            return f"{parts[0][0]}. {parts[-1]}"
+
+        # Single name or unknown - truncate if too long
+        return full_name[:10] if len(full_name) > 10 else full_name
+
+    def _fetch_ncaa_basketball_games(self, max_games: int = 50) -> List[Dict]:
+        """
+        Fetch live NCAA Men's Basketball games using NCAA API.
+
+        Args:
+            max_games: Maximum number of games to return
+
+        Returns:
+            List of game dictionaries with extracted stats
+        """
+        try:
+            # Get today's date for scoreboard
+            today = datetime.now()
+            year = today.year
+            month = str(today.month).zfill(2)
+            day = str(today.day).zfill(2)
+
+            # NCAA API scoreboard endpoint
+            url = f"{NCAA_API_BASE}/scoreboard/basketball-men/d1/{year}/{month}/{day}"
+            self.logger.debug(f"Fetching NCAA scoreboard from: {url}")
+
+            # Use requests directly since NCAA API isn't cached by api_helper
+            import requests
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            scoreboard = response.json()
+
+            if not scoreboard or 'games' not in scoreboard:
+                self.logger.debug("No scoreboard data from NCAA API")
+                return []
+
+            # Extract live games
+            live_games = []
+            total_events = len(scoreboard.get('games', []))
+            self.logger.debug(f"Processing {total_events} total NCAA games")
+
+            for game_wrapper in scoreboard.get('games', []):
+                # Stop if we've reached max games
+                if len(live_games) >= max_games:
+                    self.logger.info(f"Reached max_games limit ({max_games}) for NCAA")
+                    break
+
+                game = game_wrapper.get('game', {})
+                game_state = game.get('gameState', '')
+                game_id = game.get('gameID')
+
+                # Log game status for debugging
+                away_name = game.get('away', {}).get('names', {}).get('char6', '?')
+                home_name = game.get('home', {}).get('names', {}).get('char6', '?')
+                self.logger.info(f"NCAA Game: {away_name} @ {home_name}, State: {game_state}")
+
+                # Only process live games
+                if game_state != 'live':
+                    continue
+
+                # Parse game data
+                game_info = self._parse_ncaa_game(game)
+                if game_info:
+                    live_games.append(game_info)
+                    self.logger.info(f"Parsed NCAA game: {game_info.get('away_abbr')} @ {game_info.get('home_abbr')}, "
+                                   f"home_leaders: {bool(game_info.get('home_leaders'))}, "
+                                   f"away_leaders: {bool(game_info.get('away_leaders'))}")
+
+            self.logger.info(f"Found {len(live_games)} live NCAA games (out of {total_events} total, max={max_games})")
+            return live_games
+
+        except Exception as e:
+            self.logger.error(f"Error fetching NCAA games: {e}", exc_info=True)
+            return []
+
+    def _parse_ncaa_game(self, game: Dict) -> Optional[Dict]:
+        """
+        Parse NCAA game data and fetch boxscore for player stats.
+
+        Args:
+            game: Game dictionary from NCAA API scoreboard
+
+        Returns:
+            Dictionary with game info and stat leaders, or None if parsing fails
+        """
+        try:
+            game_id = game.get('gameID')
+            home = game.get('home', {})
+            away = game.get('away', {})
+
+            # Extract basic game info
+            game_data = {
+                'id': game_id,
+                'league': 'ncaam',
+                'home_abbr': home.get('names', {}).get('char6', 'HOME'),
+                'away_abbr': away.get('names', {}).get('char6', 'AWAY'),
+                'home_score': int(home.get('score', 0)),
+                'away_score': int(away.get('score', 0)),
+                'period': 0,  # NCAA API uses currentPeriod text
+                'clock': game.get('contestClock', ''),
+                'period_text': game.get('currentPeriod', ''),
+            }
+
+            # Fetch boxscore for player stats
+            if game_id:
+                boxscore = self._fetch_ncaa_boxscore(game_id)
+                if boxscore:
+                    game_data['home_leaders'] = self._extract_ncaa_basketball_leaders(boxscore, is_home=True)
+                    game_data['away_leaders'] = self._extract_ncaa_basketball_leaders(boxscore, is_home=False)
+
+            return game_data
+
+        except Exception as e:
+            self.logger.warning(f"Error parsing NCAA game: {e}")
+            return None
+
+    def _fetch_ncaa_boxscore(self, game_id: str) -> Optional[Dict]:
+        """
+        Fetch NCAA boxscore data.
+
+        Args:
+            game_id: NCAA game ID
+
+        Returns:
+            Boxscore data or None if unavailable
+        """
+        try:
+            url = f"{NCAA_API_BASE}/game/{game_id}/boxscore"
+            self.logger.debug(f"Fetching NCAA boxscore from: {url}")
+
+            import requests
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as e:
+            self.logger.debug(f"Error fetching NCAA boxscore for game {game_id}: {e}")
+            return None
+
+    def _extract_ncaa_basketball_leaders(self, boxscore: Dict, is_home: bool) -> Optional[Dict]:
+        """
+        Extract basketball leaders from NCAA boxscore data.
+
+        Args:
+            boxscore: Boxscore response from NCAA API
+            is_home: True for home team, False for away team
+
+        Returns:
+            Leaders dict with PTS/REB/AST leaders or None
+        """
+        try:
+            teams_info = boxscore.get('teams', [])
+            team_boxscore = boxscore.get('teamBoxscore', [])
+
+            self.logger.debug(f"NCAA boxscore has {len(teams_info)} teams and {len(team_boxscore)} team stats")
+
+            if not teams_info or not team_boxscore:
+                self.logger.debug("Missing teams or teamBoxscore data")
+                return None
+
+            # Find the correct team index (teams and teamBoxscore are in same order)
+            team_index = None
+            for idx, team_info in enumerate(teams_info):
+                if team_info.get('isHome') == is_home:
+                    team_index = idx
+                    team_name = team_info.get('nameShort', '?')
+                    self.logger.debug(f"Found {'home' if is_home else 'away'} team at index {idx}: {team_name}")
+                    break
+
+            if team_index is None or team_index >= len(team_boxscore):
+                self.logger.debug(f"Could not find team index for {'home' if is_home else 'away'}")
+                return None
+
+            team_data = team_boxscore[team_index]
+            player_stats = team_data.get('playerStats', [])
+
+            self.logger.debug(f"Found {len(player_stats)} players for {'home' if is_home else 'away'} team")
+
+            if not player_stats:
+                return None
+
+            # Find leaders for PTS, REB, AST
+            leaders = {}
+            max_pts = {'name': None, 'value': 0}
+            max_reb = {'name': None, 'value': 0}
+            max_ast = {'name': None, 'value': 0}
+
+            for player in player_stats:
+                first_name = player.get('firstName', '')
+                last_name = player.get('lastName', '')
+                full_name = f"{first_name} {last_name}".strip()
+
+                # Get stats (NCAA API returns strings)
+                try:
+                    pts = int(player.get('points', 0) or 0)
+                    reb = int(player.get('totalRebounds', 0) or 0)
+                    ast = int(player.get('assists', 0) or 0)
+
+                    if pts > max_pts['value']:
+                        max_pts = {'name': self._abbreviate_name(full_name), 'value': pts}
+                    if reb > max_reb['value']:
+                        max_reb = {'name': self._abbreviate_name(full_name), 'value': reb}
+                    if ast > max_ast['value']:
+                        max_ast = {'name': self._abbreviate_name(full_name), 'value': ast}
+
+                except (ValueError, TypeError) as e:
+                    self.logger.debug(f"Error parsing stats for {full_name}: {e}")
+                    continue
+
+            if max_pts['name']:
+                leaders['PTS'] = max_pts
+                self.logger.debug(f"PTS leader: {max_pts['name']} - {max_pts['value']}")
+            if max_reb['name']:
+                leaders['REB'] = max_reb
+                self.logger.debug(f"REB leader: {max_reb['name']} - {max_reb['value']}")
+            if max_ast['name']:
+                leaders['AST'] = max_ast
+                self.logger.debug(f"AST leader: {max_ast['name']} - {max_ast['value']}")
+
+            return leaders if leaders else None
+
+        except Exception as e:
+            self.logger.error(f"Error extracting NCAA basketball leaders: {e}", exc_info=True)
+            return None
